@@ -547,6 +547,7 @@ transforms-logs = [
   "transforms-split",
   "transforms-throttle",
   "transforms-tokenizer",
+  "transforms-cian_access_logs",
 ]
 transforms-metrics = [
   "transforms-add_tags",
@@ -570,6 +571,7 @@ transforms-ansi_stripper = []
 transforms-aws_cloudwatch_logs_subscription_parser= []
 transforms-aws_ec2_metadata = ["evmap"]
 transforms-coercer = []
+transforms-cian_access_logs = []
 transforms-compound = []
 transforms-concat = []
 transforms-dedupe = ["lru"]

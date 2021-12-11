@@ -1,5 +1,7 @@
 use snafu::Snafu;
 
+#[cfg(feature = "transforms-cian_access_logs")]
+pub mod cian_access_logs;
 #[cfg(feature = "transforms-add_fields")]
 pub mod add_fields;
 #[cfg(feature = "transforms-add_tags")]

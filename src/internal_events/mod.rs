@@ -117,6 +117,8 @@ mod remap;
 mod remove_fields;
 #[cfg(feature = "transforms-rename_fields")]
 mod rename_fields;
+#[cfg(feature = "transforms-cian_access_logs")]
+mod cian_access_logs;
 #[cfg(feature = "transforms-route")]
 mod route;
 mod sample;
@@ -277,6 +279,8 @@ pub use self::remap::*;
 pub use self::remove_fields::*;
 #[cfg(feature = "transforms-rename_fields")]
 pub use self::rename_fields::*;
+#[cfg(feature = "transforms-cian_access_logs")]
+pub use self::cian_access_logs::*;
 #[cfg(feature = "transforms-route")]
 pub use self::route::*;
 pub use self::sample::*;
