@@ -1,4 +1,6 @@
 use std::borrow::Cow;
+use std::net::Ipv4Addr;
+use std::str::FromStr;
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -72,19 +74,324 @@ fn process_nginx(log: &mut LogEvent) {
         return;
     }
 
+    let is_infra_nginx: bool = log.get("kubernetes.namespace").map_or(
+        false,
+        |v| v.to_string_lossy() == "front-infra-nginx",
+    );
+
+    remove_empty_fields(log);
+
+    convert_time_format(
+        log,
+        vec![
+            "request_time".to_string(),
+            "upstream_connect_time".to_string(),
+            "upstream_header_time".to_string(),
+        ],
+    );
 
     process_http_request(log);
 
     rename(log, &NGINX_FIELDS_MAPPING);
     delete_legacy_fields(log, &NGINX_LEGACY_FIELDS);
+
+    if !is_infra_nginx {
+        set_sla(log);
+        set_sla_type(log);
+    }
+
+    set_x_real_ip(log);
 }
 
+/*
+if type(event.log.request_time) == "string" then
+    hacks.add(event, emit, "request_time_as_string")
+    event.log.request_time = summarize_by_upstreams(event.log.request_time)
+end
+*/
+
+fn convert_time_format(log: &mut LogEvent, fields: Vec<String>) {
+    for field in fields {
+        if let Some(val) = log.get(field.clone()) {
+            match val.clone() {
+                Value::Bytes(val) => {
+                    // todo: hacks.add(event, emit, "request_time_as_string")
+                    log.insert(field, summarize_by_upstreams(String::from_utf8_lossy(&val).into_owned()));
+                }
+                _ => ()
+            }
+        }
+    }
+}
+
+/*
+summarize_by_upstreams = function(data)
+    local result = 0
+    for resp_time in data:gmatch("[0-9%.]+") do
+        result = result + tonumber(resp_time)
+    end
+    return math.floor(result * 1000 + 0.5)
+end
+*/
+fn summarize_by_upstreams(text: String) -> i32 {
+    lazy_static::lazy_static! {
+        static ref RE: Regex = Regex::new(r"[\d\.]+").unwrap();
+    }
+    let mut result: f32 = 0.0;
+    for cap in RE.captures_iter(&text) {
+        result += cap.get(0).unwrap().as_str().parse::<f32>().unwrap();
+    }
+
+    (result * 1000.0 + 0.5).floor() as i32
+}
+
+/*
+function remove_empty_fields(event)
+    for key, val in pairs(event.log) do
+        if val == "" or val == "-" then
+            event.log[key] = nil
+        end
+    end
+end
+*/
+fn remove_empty_fields(log: &mut LogEvent) {
+    let map = log.as_map_mut();
+    map.retain(|_, v | {
+        match v {
+            Value::Bytes(bytes) => {
+                let val = String::from_utf8_lossy(bytes).into_owned();
+                val != "" && val != "-"
+            },
+            _ => true
+        }
+    });
+}
+
+/*
+get_sla_type = function(event)
+    local host = event.log.host
+    local path = event.log.path
+    local user_agent = event.log.user_agent
+    if not host or not path then
+        return nil
+    end
+    host = host:lower()
+    path = path:lower()
+    if host == "metrics.cian.ru" or host == "service.cian.ru" or host == "fin.cian.ru" then
+        return nil
+    end
+    if host == "my.cian.ru" then
+        return "lk"
+    end
+
+    if host == "api.cian.ru" then
+        if (
+            path:find("^/moderation%-complaints/v%d+/get%-complaint%-types")
+            or path:find("^/moderation%-complaints/v%d+/create%-complaint")
+        ) then
+            return "moderation"
+        end
+        if (
+            path:find("^/1%.4/ios/offers")
+            or path:find("^/1%.4/ios/search%-offers/")
+            or path:find("^/search%-offers/v%d+/search%-offers%-for%-mobile%-apps")
+            or path:find("^/search%-offers/v%d+/search%-offers%-mobile%-apps")
+        ) then
+            return "ios_offers"
+        end
+        if path:find("^/lk%-specialist/") then
+            return "lk"
+        end
+        if (
+            (
+                path:find("^/search%-offers/v%d+/search%-offers%-desktop")
+                or path:find("^/search%-offers/v%d+/search%-offers%-mobile%-site")
+                or path:find("^/cian%-api/mobile%-site/v%d+/search%-offers")
+            )
+            and user_agent ~= "frontend-mobile-website"
+            and user_agent ~= "mobile-search-frontend"
+            and user_agent ~= "frontend-serp"
+        ) then
+            return "search_ajax"
+        end
+        return nil
+    end
+    if path == "/" and (host == "cian.ru" or host:find("^[a-z]+%.cian%.ru$")) then
+        return "main"
+    end
+    if path == "/novostrojki/" or path == "/commercial/" or path == "/posutochno/" or path == "/snyat/" or path == "/kupit/" then
+        return "vertical"
+    end
+    if starts_with(path, "/sale") or starts_with(path, "/rent") then
+        return "card"
+    end
+    if starts_with(path, "/cat.php") or starts_with(path, "/snyat") or starts_with(path, "/kupit") then
+        return "search"
+    end
+    if path:find("^/1%.0/data/") then
+        return "lk"
+    end
+    if not path:find("draft") and (
+        path:find("^/realty/add[1-4]%.aspx")
+        or path:find("^/razmestit%-obyavlenie")
+        or path:find("^/addform/v%d+/geocode")
+        or path:find("^/addform/v%d+/offers")
+        or path:find("^/addform/v%d+/publish%-terms")
+    ) then
+        return "add_form"
+    end
+    if path:find("favorites") then
+        return "favorites"
+    end
+    return nil
+end
+*/
+
+fn set_sla_type(log: &mut LogEvent) {
+    if let Some(sla_type) = get_sla_type(log) {
+        log.insert("sla_type", sla_type);
+    };
+}
+
+fn get_sla_type(log: &LogEvent) -> Option<String> {
+    let host = log.get("host").map(|v| v.to_string_lossy());
+    let path = log.get("path").map(|v| v.to_string_lossy());
+    let user_agent = log.get("user_agent").map(|v| v.to_string_lossy()).unwrap_or("".to_string());
+
+    if host.is_none() || path.is_none() {
+        return None;
+    }
+
+    let host = host.unwrap().to_lowercase();
+    let path = path.unwrap().to_lowercase();
+
+    if host == "metrics.cian.ru" || host == "service.cian.ru" || host == "fin.cian.ru" {
+        return None;
+    }
+
+    if host == "my.cian.ru" {
+        return Some("lk".to_string());
+    }
+
+    let path_match = |re| text_match(&path, re);
+    let host_match = |re| text_match(&host, re);
+
+    if host == "api.cian.ru" {
+        if path_match(r"^/moderation-complaints/v\d+/get-complaint-types") ||
+            path_match(r"^/moderation-complaints/v\d+/create-complaint")
+        {
+            return Some("moderation".to_string());
+        }
+        if path_match(r"^/1\.4/ios/offers") ||
+            path_match(r"^/1\.4/ios/search-offers/") ||
+            path_match(r"^/search-offers/v\d+/search-offers-for-mobile-apps") ||
+            path_match(r"^/search-offers/v\d+/search-offers-mobile-apps")
+        {
+            return Some("ios_offers".to_string());
+        }
+        if path_match(r"^/lk-specialist/") {
+            return Some("lk".to_string());
+        }
+
+        if (
+            path_match(r"^/search-offers/v\d+/search-offers-desktop") ||
+                path_match(r"^/search-offers/v\d+/search-offers-mobile-site") ||
+                path_match(r"^/cian-api/mobile-site/v\d+/search-offers")
+        ) && user_agent != "frontend-mobile-website"
+            && user_agent != "mobile-search-frontend"
+            && user_agent != "frontend-serp"
+        {
+            return Some("search_ajax".to_string());
+        }
+        return None;
+    }
+
+    if path == "/" && (host == "cian.ru" || host_match(r"^[a-z]+\.cian\.ru$")) {
+        return Some("main".to_string());
+    }
+
+    if path == "/novostrojki/" || path == "/commercial/" || path == "/posutochno/" || path == "/snyat/" || path == "/kupit/" {
+        return Some("vertical".to_string());
+    }
+    if path.starts_with("/sale") || path.starts_with("/rent") {
+        return Some("card".to_string());
+    }
+
+
+    if path.starts_with("/cat.php") || path.starts_with("/snyat") || path.starts_with("/kupit") {
+        return Some("search".to_string());
+    }
+
+    if path_match(r"^/1\.0/data/") {
+        return Some("lk".to_string());
+    }
+
+    if !path_match("draft") && (
+        path_match(r"^/realty/add[1-4]\.aspx")
+            || path_match(r"^/razmestit-obyavlenie")
+            || path_match(r"^/addform/v\d+/geocode")
+            || path_match(r"^/addform/v\d+/offers")
+            || path_match(r"^/addform/v\d+/publish-terms")
+    ) {
+        return Some("add_form".to_string());
+    }
+    if path_match("favorites") {
+        return Some("favorites".to_string());
+    }
+    return None;
+}
+
+fn text_match(text: &str, pattern: &str) -> bool {
+    // Todo: re cache
+    let re: Regex = Regex::new(pattern).unwrap();
+    re.is_match(text)
+}
 
 fn process_http_request(log: &mut LogEvent) {
     enrich_by_url(log);
     unpack_x_headers(log);
 }
 
+
+/*
+get_sla = function(event)
+    if not event.log.response or event.log.response_time == nil then
+        return nil
+    end
+    if event.log.response >= 500 and event.log.response ~= 511 then
+        return "fail"
+    end
+    if event.log.response_time >= 500 then
+        return "timeout"
+    end
+    return "success"
+end
+*/
+
+fn set_sla(log: &mut LogEvent) {
+    let response = log.get("response");
+    let response_time = log.get("response_time");
+
+    if response.is_none() && response_time.is_none() {
+        return;
+    }
+
+
+    if let Some(&Value::Integer(response)) = response {
+        if response >= 500 && response != 511 {
+            log.try_insert("sla", "fail");
+            return;
+        }
+    }
+
+    let sla = match response_time {
+        Some(&Value::Float(time)) if time >= 500 as f64 => { "timeout" }
+        Some(&Value::Integer(time)) if time >= 500 => { "timeout" }
+        _ => { "success" }
+    };
+
+    log.try_insert("sla", sla);
+}
 
 /*
 enrich_by_url = function (event)
@@ -122,7 +429,7 @@ fn enrich_by_url(log: &mut LogEvent) {
         }
     }
 
-    if let Some(path) = log.get("path").clone() {
+    if let Some(path) = log.get("path") {
         let raw_path = path.to_string_lossy();
         log.try_insert("path_simplified", get_path_simplified(raw_path));
     }
@@ -148,10 +455,33 @@ fn get_path_simplified(path: String) -> String {
 
     for prefix in CHPU_PREFIXES {
         if path.starts_with(prefix) {
-            return format!("{}-x", prefix);
+            return format!("{}x", prefix);
         }
     }
     path
+}
+
+/*
+set_x_real_ip = function(event)
+    if event.log.remote_addr and (
+        not event.log.x_real_ip
+        or not event.log.x_real_ip:find("^%d%d?%d?%.%d%d?%d?%.%d%d?%d?%.%d%d?%d?$") -- не IP-адрес
+    ) then
+        event.log.x_real_ip = event.log.remote_addr
+    end
+end
+*/
+fn set_x_real_ip(log: &mut LogEvent) {
+    if let Some(remote_addr) = log.get("remote_addr") {
+        let need_set = if let Some(x_real_ip) = log.get("x_real_ip") {
+            if let Err(_) = Ipv4Addr::from_str(&x_real_ip.to_string_lossy()) { true } else { false }
+        } else { true };
+
+        if need_set {
+            let remote_addr = remote_addr.to_string_lossy();
+            log.insert("x_real_ip", remote_addr);
+        }
+    }
 }
 
 
